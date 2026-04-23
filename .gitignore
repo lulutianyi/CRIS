@@ -1,0 +1,10 @@
+# 忽略所有压缩包
+*.tar.gz
+*.zip
+
+# 忽略数据集文件夹
+VAE_mobilenet/data/VAE_mobilenet/data/
+*.tar.gz
+VAE_mobilenet/data/cifar-10-batches-py/
+__pycache__/
+*.pyc
