@@ -1,6 +1,7 @@
 import glob
 import os
 import time
+import zipfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 
 try:
-    from compressai.models import FactorizedPrior
+    from compressai.models import Cheng2020Anchor
 except ImportError:
     raise ImportError("请先运行: pip install compressai")
 
@@ -21,33 +22,104 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-# ===== 配置（与你原来保持一致）=====
-IMG_SIZE        = 416
-BATCH_SIZE      = 16
-NUM_WORKERS     = 0
-MAX_TRAIN_SAMPLES = 2048
-MAX_VAL_SAMPLES   = 512
-LOG_EVERY       = 20
-DATA_ROOT       = "/content/D-Fire"
-EPOCHS          = 30
+# ===== 配置 =====
+IMG_SIZE            = 384
+BATCH_SIZE          = 16
+NUM_WORKERS         = 0
+MAX_TRAIN_SAMPLES   = 2048
+MAX_VAL_SAMPLES     = 512
+LOG_EVERY           = 20
+DATA_ROOT           = "/content/D-Fire"
+EPOCHS              = 30
 EARLY_STOP_PATIENCE = 5
-
-# 率失真权衡：λ 越大越重视失真（PSNR），越小越重视压缩率（bpp）
-# 推荐先用 0.01 跑通，再试 0.001（更低比特率）或 0.05（更高PSNR）
-LAMBDA          = 0.01
-
-LR_MAIN         = 1e-4   # 主网络（encoder + decoder + hyperprior）
-LR_AUX          = 1e-3   # 熵模型辅助参数，CompressAI 官方推荐比主网络大一个量级
-GRAD_CLIP_NORM  = 1.0
+LAMBDA              = 0.05
+LR_MAIN             = 5e-5
+LR_AUX              = 1e-3
+GRAD_CLIP_NORM      = 1.0
 
 save_dir = "outputs_compressai"
 os.makedirs(save_dir, exist_ok=True)
 
-history = {
-    "train_loss": [], "val_loss": [],
-    "train_psnr": [], "val_psnr": [],
-    "train_bpp":  [], "val_bpp":  [],
-}
+# ===== 自动下载 D-Fire 数据集 =====
+def download_dfire(data_root=DATA_ROOT):
+    """
+    从 GitHub Release 下载 D-Fire 数据集并解压。
+    如果数据目录已存在且包含图片则跳过。
+    """
+    train_img_dir = os.path.join(data_root, "train", "images")
+    test_img_dir  = os.path.join(data_root, "test",  "images")
+
+    already_exists = (
+        os.path.isdir(train_img_dir) and len(glob.glob(os.path.join(train_img_dir, "*.jpg"))) > 0
+        and os.path.isdir(test_img_dir)  and len(glob.glob(os.path.join(test_img_dir,  "*.jpg"))) > 0
+    )
+    if already_exists:
+        n_train = len(glob.glob(os.path.join(train_img_dir, "*.jpg")))
+        n_test  = len(glob.glob(os.path.join(test_img_dir,  "*.jpg")))
+        print(f"D-Fire 已存在：train={n_train} 张, test={n_test} 张，跳过下载。", flush=True)
+        return
+
+    # ---------- 尝试用 kaggle API 下载（Colab 推荐方式）----------
+    try:
+        import kaggle  # noqa: F401
+        print("检测到 kaggle，使用 Kaggle API 下载 D-Fire ...", flush=True)
+        os.makedirs(data_root, exist_ok=True)
+        os.system(
+            f'kaggle datasets download -d phylake1337/dfire-dataset -p "{data_root}" --unzip'
+        )
+        print("Kaggle 下载完成。", flush=True)
+        return
+    except Exception:
+        pass
+
+    # ---------- 尝试从 Hugging Face Hub 下载 ----------
+    try:
+        from huggingface_hub import snapshot_download
+        print("尝试从 Hugging Face Hub 下载 D-Fire ...", flush=True)
+        snapshot_download(
+            repo_id="pyronear/d-fire",
+            repo_type="dataset",
+            local_dir=data_root,
+        )
+        print("Hugging Face 下载完成。", flush=True)
+        return
+    except Exception:
+        pass
+
+    # ---------- 最后兜底：从 GitHub Release 下载 zip ----------
+    import urllib.request
+
+    GITHUB_URL = (
+        "https://github.com/gaiasd/DFireDataset/releases/download/v1.0/"
+        "D-Fire.zip"
+    )
+    zip_path = os.path.join(data_root, "D-Fire.zip")
+    os.makedirs(data_root, exist_ok=True)
+
+    print(f"正在从 GitHub 下载 D-Fire（~3 GB），请耐心等待...", flush=True)
+
+    def _progress(block_num, block_size, total_size):
+        if total_size > 0:
+            pct = block_num * block_size / total_size * 100
+            print(f"\r  下载进度: {min(pct, 100):.1f}%", end="", flush=True)
+
+    try:
+        urllib.request.urlretrieve(GITHUB_URL, zip_path, reporthook=_progress)
+        print("\n下载完成，正在解压...", flush=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(data_root)
+        os.remove(zip_path)
+        print("解压完成。", flush=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"自动下载失败：{e}\n"
+            "请手动下载 D-Fire 数据集并解压到 /content/D-Fire，\n"
+            "目录结构应为：\n"
+            "  /content/D-Fire/train/images/*.jpg\n"
+            "  /content/D-Fire/test/images/*.jpg"
+        )
+
+download_dfire()
 
 # ===== 设备 =====
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,14 +129,12 @@ print(f"Device: {device}", flush=True)
 if device.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
-
-# ===== 数据集（完全复用你原来的 DFireDataset）=====
-# 注意：去掉了 Normalize，CompressAI 期望输入在 [0, 1]
+# ===== 数据集 =====
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
     transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),          # 输出已在 [0, 1]，不再 Normalize
+    transforms.ToTensor(),
 ])
 
 val_transform = transforms.Compose([
@@ -75,7 +145,6 @@ val_transform = transforms.Compose([
 
 
 class DFireDataset(Dataset):
-    """D-Fire: root/{train,test}/images/*.jpg  （原样复用）"""
     def __init__(self, root, split="train", transform=None):
         assert split in ("train", "test")
         img_dir = os.path.join(root, split, "images")
@@ -105,7 +174,6 @@ def maybe_subset(dataset, max_samples):
 
 @torch.no_grad()
 def batch_psnr(recon, target):
-    """原样复用"""
     mse = (recon - target).pow(2).mean(dim=(1, 2, 3))
     return (10 * torch.log10(1.0 / mse.clamp(min=1e-8))).mean().item()
 
@@ -134,29 +202,64 @@ print(
 )
 
 # ===== 模型 =====
-# quality=3 对应中等比特率，范围 1~8；T4 显存跑 quality<=5 比较稳
-# pretrained=False 从头在 D-Fire 上训练
 print("Building model...", flush=True)
-# N=128 是超先验通道数，M=192 是主潜变量通道数
-# 对应原来 quality=3 的参数量，T4 显存完全够用
-model = FactorizedPrior(N=128, M=192).to(device)
+model = Cheng2020Anchor(N=128).to(device)
 print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M", flush=True)
 
-# ===== 优化器（CompressAI 标准双优化器写法）=====
-# main optimizer: encoder + decoder + hyperprior 主体参数
-# aux  optimizer: 熵模型内部的 CDF 参数，单独更新
+# ===== 优化器 =====
 optimizer     = optim.Adam(model.parameters(), lr=LR_MAIN)
 aux_optimizer = optim.Adam(model.entropy_bottleneck.parameters(), lr=LR_AUX)
-
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+scheduler     = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="max", factor=0.5, patience=2, min_lr=1e-7
 )
 
-# ===== 训练循环 =====
-best_psnr      = 0.0
+# ===== 断点续训 =====
+# history 先初始化空
+history = {
+    "train_loss": [], "val_loss": [],
+    "train_psnr": [], "val_psnr": [],
+    "train_bpp":  [], "val_bpp":  [],
+}
+
+best_psnr         = 0.0
+start_epoch       = 0
 epochs_no_improve = 0
 
-for epoch in range(EPOCHS):
+CKPT_PATH = f"{save_dir}/best_model.pth"
+
+if os.path.isfile(CKPT_PATH):
+    print(f"发现已有 checkpoint：{CKPT_PATH}，正在恢复...", flush=True)
+    ckpt = torch.load(CKPT_PATH, map_location=device)
+
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+
+    # aux_optimizer 状态（旧版 checkpoint 可能没有，兼容处理）
+    if "aux_optimizer" in ckpt:
+        aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
+
+    # scheduler 状态
+    if "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+
+    # 训练历史
+    if "history" in ckpt:
+        history = ckpt["history"]
+
+    best_psnr         = ckpt.get("val_psnr", 0.0)
+    epochs_no_improve = ckpt.get("epochs_no_improve", 0)
+    start_epoch       = ckpt.get("epoch", 0)   # 已完成的 epoch 数
+
+    print(
+        f"已恢复到 Epoch {start_epoch}，最优 PSNR={best_psnr:.2f} dB，"
+        f"从 Epoch {start_epoch + 1} 继续训练。",
+        flush=True,
+    )
+else:
+    print("未找到 checkpoint，从头开始训练。", flush=True)
+
+# ===== 训练循环 =====
+for epoch in range(start_epoch, EPOCHS):
     t_epoch = time.time()
 
     # ---------- Train ----------
@@ -171,31 +274,19 @@ for epoch in range(EPOCHS):
         optimizer.zero_grad(set_to_none=True)
         aux_optimizer.zero_grad(set_to_none=True)
 
-        # forward：返回 {"x_hat", "likelihoods": {"y":…, "z":…}}
-        out = model(imgs)
+        out   = model(imgs)
         x_hat = out["x_hat"].clamp(0, 1)
 
-        # 比特率估算（bpp）
-        num_pixels = imgs.shape[0] * imgs.shape[2] * imgs.shape[3]
-        bpp = sum(
-            (-torch.log2(lk).sum() / num_pixels)
-            for lk in out["likelihoods"].values()
-        )
-
-        # 失真（MSE，与你原来保持一致；若要换 MS-SSIM 在此处替换）
-        distortion = torch.nn.functional.mse_loss(x_hat, imgs)
-
-        # 率失真联合损失
-        loss = bpp + LAMBDA * 255**2 * distortion
-        # 注：乘以 255^2 是将 MSE 从 [0,1] 域折算到 [0,255] 域，
-        #     让 LAMBDA 的量级和文献中保持一致
+        num_pixels  = imgs.shape[0] * imgs.shape[2] * imgs.shape[3]
+        bpp         = sum((-torch.log2(lk).sum() / num_pixels) for lk in out["likelihoods"].values())
+        distortion  = torch.nn.functional.mse_loss(x_hat, imgs)
+        loss        = bpp + LAMBDA * 255**2 * distortion
 
         loss.backward()
         if GRAD_CLIP_NORM:
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
 
-        # 辅助损失（熵模型 CDF 参数），独立 backward + step
         aux_loss = model.entropy_bottleneck.loss()
         aux_loss.backward()
         aux_optimizer.step()
@@ -219,17 +310,14 @@ for epoch in range(EPOCHS):
 
     with torch.no_grad():
         for imgs, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [val]", leave=False):
-            imgs = imgs.to(device, non_blocking=True)
-            out  = model(imgs)
+            imgs  = imgs.to(device, non_blocking=True)
+            out   = model(imgs)
             x_hat = out["x_hat"].clamp(0, 1)
 
             num_pixels = imgs.shape[0] * imgs.shape[2] * imgs.shape[3]
-            bpp = sum(
-                (-torch.log2(lk).sum() / num_pixels)
-                for lk in out["likelihoods"].values()
-            )
+            bpp        = sum((-torch.log2(lk).sum() / num_pixels) for lk in out["likelihoods"].values())
             distortion = torch.nn.functional.mse_loss(x_hat, imgs)
-            loss = bpp + LAMBDA * 255**2 * distortion
+            loss       = bpp + LAMBDA * 255**2 * distortion
 
             val_loss += loss.item()
             val_bpp  += bpp.item()
@@ -239,7 +327,7 @@ for epoch in range(EPOCHS):
     avg_val_loss = val_loss / n_val
     avg_val_bpp  = val_bpp  / n_val
     avg_val_psnr = val_psnr / n_val
-    elapsed = time.time() - t_epoch
+    elapsed      = time.time() - t_epoch
 
     history["train_loss"].append(avg_train_loss)
     history["val_loss"].append(avg_val_loss)
@@ -260,17 +348,22 @@ for epoch in range(EPOCHS):
 
     # ---------- Checkpoint ----------
     if avg_val_psnr > best_psnr:
-        best_psnr = avg_val_psnr
+        best_psnr         = avg_val_psnr
         epochs_no_improve = 0
+
         torch.save(
             {
-                "epoch": epoch + 1,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_psnr": avg_val_psnr,
-                "val_bpp":  avg_val_bpp,
+                "epoch":           epoch + 1,          # 已完成的 epoch 数
+                "model":           model.state_dict(),
+                "optimizer":       optimizer.state_dict(),
+                "aux_optimizer":   aux_optimizer.state_dict(),  # ← 新增
+                "scheduler":       scheduler.state_dict(),      # ← 新增
+                "history":         history,                     # ← 新增
+                "val_psnr":        avg_val_psnr,
+                "val_bpp":         avg_val_bpp,
+                "epochs_no_improve": epochs_no_improve,         # ← 新增
             },
-            f"{save_dir}/best_model.pth",
+            CKPT_PATH,
         )
         print(f"  → 保存最优模型 PSNR={best_psnr:.2f} dB  bpp={avg_val_bpp:.4f}", flush=True)
     else:
@@ -283,7 +376,7 @@ for epoch in range(EPOCHS):
             )
             break
 
-# ===== 曲线绘图（原样复用）=====
+# ===== 曲线绘图 =====
 epochs_ran = range(1, len(history["train_loss"]) + 1)
 
 plt.figure()
@@ -307,7 +400,6 @@ plt.xlabel("Epoch"); plt.ylabel("bpp")
 plt.title("Bitrate Curve"); plt.legend(); plt.grid()
 plt.savefig(f"{save_dir}/bpp_curve.png"); plt.show()
 
-# ===== 率失真散点（每 epoch 一个点）=====
 plt.figure()
 plt.scatter(history["val_bpp"], history["val_psnr"], c=list(epochs_ran), cmap="viridis")
 plt.colorbar(label="Epoch")
