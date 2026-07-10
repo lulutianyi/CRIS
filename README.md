@@ -33,3 +33,19 @@ A. 增大残差网络容量（更深/更宽的UNet）
 B. 改进残差网络的损失函数（加入检测特征损失，而不只是L1像素损失）
 C. 尝试多步迭代精化（更接近完整RDDM的扩散思想）
 D. 回头优化任务联合损失本身（增大μ权重，或换检测头损失而非特征L2距离）
+
+实际上现在很多的purifier，都是争对classifier设计的，没有太多的purifier会去争对object detection来设计，也就是说实际上很多的purifier的目的都是去最大化图像的loglikelihood或者说是score，忽略了image的整体语义完整性以及sub-image（比如image patch或者pixel）之间的co-relationship，如果那些经典的purifer在object detection上并没有我们想象中那么大的净化效果，那么这一点其实可以算作我们一个比较新颖的出发点。
+
+关于第(2)条,这个思路其实跟binary/Bernoulli diffusion purification框架是高度相关的，我们已经在D-Fire上验证过对抗净化的效果。DiffPure本质上也是走的"扩散模型去噪+还原"路线，只是它是连续扩散（score-based），而且原始设计确实是围绕classifier的loglikelihood/score maximization展开的，没有专门考虑：
+
+- **语义完整性**：净化后的图像在像素级"看起来对"，但目标检测需要的是bounding box级别的空间-语义一致性，这两者不完全等价
+- **patch间的co-relationship**：object detection任务对局部结构（边缘、纹理连续性）比纯分类更敏感，如果purifier只优化全局score，可能会破坏对检测有用的局部结构信息
+
+如果能证明"经典DiffPure在detection任务上净化效果显著弱于它在classification任务上的效果"，这就是一个很扎实的motivation，可以直接writeup成论文里的实验对照组。
+
+具体目标：
+
+1. **跑DiffPure的环境搭建/适配**——把它接到D-Fire数据集和你的YOLOv8/检测pipeline上，而不是它原本针对CIFAR/ImageNet分类器设计的评测方式
+2. **设计对照实验**——比如同一批对抗样本，分别测(a) DiffPure净化后过classifier的准确率变化 vs (b) DiffPure净化后过detector的mAP变化，量化这个"gap"
+3. **梳理这段"novelty"的论文表述**，把"经典purifier忽略语义完整性和patch相关性"这个论点写得更严谨
+
