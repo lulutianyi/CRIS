@@ -14,11 +14,11 @@ FlowPure 部分，并直接复用当前 Colab 会话中已经存在的：
 
 正确载入方式（必须保留 -i，共享 notebook 内存）：
 
-    %run -i /content/flowpure_dfire.py
+    %run -i /content/methods/flowpure_dfire.py
 
 不要再使用：
 
-    !python /content/flowpure_dfire.py ...
+    !python /content/methods/flowpure_dfire.py ...
 
 因为 !python 会启动一个看不到 notebook 现有变量的新进程。
 
@@ -75,7 +75,7 @@ def flowpure_check_notebook_environment() -> str:
             "FlowPure 扩展无法访问 notebook 中已定义的对象："
             + ", ".join(missing)
             + "。请先按顺序运行 gcn.ipynb 到 ATTN 定义单元，然后使用 "
-            + "%run -i /content/flowpure_dfire.py；不要用 !python。"
+            + "%run -i /content/methods/flowpure_dfire.py；不要用 !python。"
         )
 
     dfire_root = str(bld.DFIRE_ROOT)

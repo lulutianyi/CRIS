@@ -11,12 +11,12 @@ On Colab, the script installs Ultralytics when missing and mounts Drive when
 needed. It does not download D-Fire because Kaggle authentication is interactive.
 
 Run all stages:
-    %run /content/shared_pgd_gcn_flowpure_compare.py --stage all
+    %run /content/core/shared_pgd_gcn_flowpure_compare.py --stage all
 
 Or resume stage by stage:
-    %run /content/shared_pgd_gcn_flowpure_compare.py --stage generate
-    %run /content/shared_pgd_gcn_flowpure_compare.py --stage purify
-    %run /content/shared_pgd_gcn_flowpure_compare.py --stage map
+    %run /content/core/shared_pgd_gcn_flowpure_compare.py --stage generate
+    %run /content/core/shared_pgd_gcn_flowpure_compare.py --stage purify
+    %run /content/core/shared_pgd_gcn_flowpure_compare.py --stage map
 
 This script performs evaluation only. It never trains or overwrites model weights.
 The checkpoints are state_dict files, so the exact architecture definitions are

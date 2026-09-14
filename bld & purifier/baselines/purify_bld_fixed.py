@@ -34,7 +34,7 @@ from tqdm import tqdm
 # ==============================================================================
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-DFIRE_ROOT  = "/content/drive/MyDrive/D-Fire"  # ← change to your path
+DFIRE_ROOT  = "/content/D-Fire"  # ← change to your path
 
 IMG_SIZE    = 128          # resize D-Fire to 128x128
 BATCH_SIZE  = 32
@@ -436,7 +436,7 @@ class DiffUNet(nn.Module):
         self.downs       = nn.ModuleList()
         self.downsamples = nn.ModuleList()
         ch_in = base_ch
-        self.enc_chs = [ch_in]
+        self.enc_chs = []
 
         for i, ch_out in enumerate(chs):
             res = latent_size // (2 ** i)
@@ -459,9 +459,9 @@ class DiffUNet(nn.Module):
         self.ups       = nn.ModuleList()
         self.upsamples = nn.ModuleList()
         rev_chs = list(reversed(chs))
-        rev_enc = list(reversed(self.enc_chs[:-1]))
+        rev_enc = list(reversed(self.enc_chs))
 
-        for i, (ch_out, skip_ch) in enumerate(zip(rev_chs, rev_enc + [base_ch])):
+        for i, (ch_out, skip_ch) in enumerate(zip(rev_chs, rev_enc)):
             res = latent_size // (2 ** (len(chs) - 1 - i))
             self.ups.append(nn.ModuleList([
                 ResidualBlock(ch_in + skip_ch, ch_out, t_dim, dropout),
@@ -488,7 +488,7 @@ class DiffUNet(nn.Module):
     def forward(self, x, t):
         t_emb = self.t_mlp(self.sin_embed(t, self.t_mlp[0].in_features))
         h     = self.in_conv(x)
-        skips = [h]
+        skips = []
 
         for (r1, r2, attn), ds in zip(self.downs, self.downsamples):
             h = attn(r2(r1(h, t_emb), t_emb))
