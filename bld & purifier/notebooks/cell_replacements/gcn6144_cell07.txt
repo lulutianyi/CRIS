@@ -1,0 +1,126 @@
+# [第7单元] Learned-v2 3072 -> 6144 bit：保留旧通道和初始输出
+from pathlib import Path
+import copy
+import json
+import hashlib
+
+SOURCE_3072_CKPT = (
+    "/content/drive/MyDrive/gcn_ae_checkpoints/skip_learned_v2/"
+    "gcn_skip_learned_v2_taskaware_best.pt"
+)
+# New directory: do not reuse the previous randomly initialized expansion.
+GCN6144_DIR = "/content/drive/MyDrive/gcn_ae_checkpoints/skip6144_preserve_learnedv2"
+GCN6144_SHAPES = {"64x64": (8, 16), "32x32": (32, 8)}
+GCN6144_HIDDEN = {"64x64": 32, "32x32": 64}
+SOURCE3072_SHAPES = {"64x64": (2, 16), "32x32": (8, 8)}
+
+def _checkpoint_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def _new_skip_model(shapes):
+    config = GCNSkipAEConfig(
+        active_levels=["64x64", "32x32"],
+        skip_quantizer_mode="learned_v2",
+        skip_level_code_shapes=shapes.copy(),
+        skip_hidden_channels=GCN6144_HIDDEN.copy(),
+    )
+    return build_gcn_ae(BinaryAutoEncoderAttn().to(bld.DEVICE), config)
+
+@torch.no_grad()
+def check_expansion_matches(old, expanded, images=None, atol=2e-4):
+    """Structural sanity check, not an mAP test or a guarantee of recovery rate."""
+    old.eval()
+    expanded.eval()
+    if images is None:
+        generator = torch.Generator(device="cpu").manual_seed(6144)
+        images = torch.rand(1, 3, 128, 128, generator=generator)
+    images = images.to(bld.DEVICE)
+    if tuple(images.shape[1:]) != (3, 128, 128):
+        raise ValueError("Check input must have shape [B,3,128,128]")
+    z0, s0 = old.encode_all_codes(images)
+    z1, s1 = expanded.encode_all_codes(images)
+    if not torch.equal(z0, z1):
+        raise RuntimeError("Main codes changed during expansion")
+    for name in s0:
+        channels = s0[name].shape[1]
+        if not torch.equal(s0[name], s1[name][:, :channels]):
+            raise RuntimeError(f"Preserved skip bits differ: {name}")
+    y0 = old.decode_from_codes(z0, s0)
+    y1 = expanded.decode_from_codes(z1, s1)
+    error = (y0-y1).abs().max().item()
+    if not torch.isfinite(y1).all() or error > atol:
+        raise RuntimeError(f"Expansion output mismatch: max_abs_error={error:.8g}")
+    print(f"Expansion check passed: main/old skip bits match; output max error={error:.8g}")
+    return error
+
+def make_gcn6144(source_checkpoint=SOURCE_3072_CKPT, resume6144=False):
+    path = Path(source_checkpoint)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    raw = torch.load(str(path), map_location="cpu")
+    state = _unwrap_gcn_state_dict(raw)
+    if isinstance(raw, dict) and "model" in raw:
+        state = raw["model"]
+    expanded = _new_skip_model(GCN6144_SHAPES)
+    if resume6144:
+        # Only fixed-hidden-width 6144 checkpoints fit this definition.
+        # The earlier skip_6144_from_v3 checkpoints are a different architecture.
+        expanded.load_state_dict(state, strict=True)
+        print("Strictly loaded new-architecture 6144 checkpoint:", path)
+    else:
+        old = _new_skip_model(SOURCE3072_SHAPES)
+        old.load_state_dict(state, strict=True)
+        source, target = old.state_dict(), expanded.state_dict()
+        transformed = {}
+        expected_changed = set()
+        for name, quantizer in expanded.decoder.skip_quantizers.items():
+            prefix = f"decoder.skip_quantizers.{name}."
+            last = len(quantizer.encoder_net)-1
+            expected_changed.update({
+                prefix + f"encoder_net.{last}.weight",
+                prefix + f"encoder_net.{last}.bias",
+                prefix + "decoder_net.0.weight",
+            })
+        if set(source) != set(target):
+            raise RuntimeError("Unexpected state_dict keys; source must be Learned-v2")
+        actual_changed = {key for key in source if source[key].shape != target[key].shape}
+        if actual_changed != expected_changed:
+            raise RuntimeError(f"Unexpected shape changes: {actual_changed ^ expected_changed}")
+        for key, value in source.items():
+            if key not in expected_changed:
+                target[key].copy_(value)
+        for name, quantizer in expanded.decoder.skip_quantizers.items():
+            old_channels = SOURCE3072_SHAPES[name][0]
+            prefix = f"decoder.skip_quantizers.{name}."
+            last = len(quantizer.encoder_net)-1
+            for suffix in ("weight", "bias"):
+                key = prefix + f"encoder_net.{last}.{suffix}"
+                target[key][:old_channels].copy_(source[key])
+            key = prefix + "decoder_net.0.weight"
+            target[key].zero_()
+            target[key][:, :old_channels].copy_(source[key])
+            transformed[name] = {
+                "old_code_channels": old_channels,
+                "new_code_channels": quantizer.code_channels,
+                "hidden_channels": quantizer.hidden_channels,
+            }
+        expanded.load_state_dict(target, strict=True)
+        error = check_expansion_matches(old, expanded)
+        expanded._expansion_check = {"max_abs_error": error, "streams": transformed}
+        del old
+        print("Preserved expansion initialized from:", path)
+    assert expanded.D == 2048 and expanded.total_bit_budget() == 6144
+    expanded._initial_checkpoint = str(path)
+    expanded._initial_checkpoint_sha256 = _checkpoint_sha256(path)
+    expanded._new_tensor_names = []  # no whole old tensor was discarded
+    expanded.eval()
+    print("Source SHA256:", expanded._initial_checkpoint_sha256)
+    print("main=2048, skip64=2048, skip32=2048; hidden=32/64; total=6144")
+    return expanded
+
+# Build only; no training. Re-running resets the in-memory model to this source.
+ae_gcn_6144 = make_gcn6144()

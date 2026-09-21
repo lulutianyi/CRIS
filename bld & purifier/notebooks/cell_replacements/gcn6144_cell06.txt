@@ -1,0 +1,1090 @@
+# ==============================================================================
+# 【最终基础模型｜Learned-v2 GCN-Skip定义 + 可选任务感知续训】
+# 6144-bit 保输出扩容定义；第7单元从 Learned-v2 3072-bit 权重复制旧通道。
+# 默认 RUN_GCN_CLEAN_TASKAWARE_TRAINING=False：只定义代码，不会重新训练。
+# ==============================================================================
+
+import json
+import os
+import shutil
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Tuple, Dict, Callable
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+import yaml
+from PIL import Image
+from tqdm import tqdm
+
+# 假设 bld 已经在当前脚本/notebook 中 import 好
+ResnetBlock = bld.ResnetBlock
+AttnBlock   = bld.AttnBlock
+Downsample  = bld.Downsample
+Upsample    = bld.Upsample
+Normalize   = bld.Normalize
+
+
+# ==================== 1. 架构自动识别 ====================
+
+def _out_channels(module) -> Optional[int]:
+    """尝试拿到一个bld模块的输出通道数；识别不了(比如Normalize/Sigmoid)就返回None，
+    表示"沿用之前记录的通道数"（这些模块不改变通道数）"""
+    if isinstance(module, nn.Conv2d):
+        return module.out_channels
+    if isinstance(module, ResnetBlock):
+        return module.conv2.out_channels
+    if isinstance(module, AttnBlock):
+        return module.proj.out_channels
+    return None
+
+
+def _inspect_stages(seq, resize_cls) -> List[Dict]:
+    """
+    把一个 nn.Sequential 按 Downsample/Upsample 出现的位置切成若干段，每段对应一个分辨率级别。
+    返回 [{"slice": (start,end), "channels": c}, ...]
+    slice 是 [start,end) 左闭右开，不包含触发分辨率变化的那个 Downsample/Upsample 模块本身。
+    """
+    stages, start, ch = [], 0, None
+    modules = list(seq)
+    for i, m in enumerate(modules):
+        c = _out_channels(m)
+        if c is not None:
+            ch = c
+        if isinstance(m, resize_cls):
+            stages.append({"slice": (start, i), "channels": ch})
+            start = i + 1
+    stages.append({"slice": (start, len(modules)), "channels": ch})
+    return stages
+
+
+@dataclass
+class SkipLevelSpec:
+    name: str                    # 比如"64x64"，仅用于打印/按名字启用
+    channels: int
+    enc_slice: Tuple[int, int]   # encoder.conv_layers里该级别的[start,end)，end之后紧接着Downsample
+    dec_insert_after: int        # decoder.conv_layers里，在这个索引对应模块forward之后插入GCN
+    spatial_size: Optional[int] = None  # 该层实际空间分辨率，供learned skip量化器构造下/上采样路径
+
+
+def auto_detect_skip_levels(base_ae, img_size: Optional[int] = None) -> List[SkipLevelSpec]:
+    """
+    自动扫描 base_ae.encoder / base_ae.decoder 的 conv_layers，定位所有可以插GCN skip的中间
+    分辨率级别，自动排除最外层和bottleneck层。对 bld.BinaryAutoEncoder 和 ae_attn 都适用。
+    """
+    enc_stages = _inspect_stages(base_ae.encoder.conv_layers, Downsample)
+    dec_stages = _inspect_stages(base_ae.decoder.conv_layers, Upsample)
+    n_down = len(enc_stages) - 1
+
+    if n_down != len(dec_stages) - 1:
+        raise ValueError(
+            f"encoder下采样次数({n_down}) != decoder上采样次数({len(dec_stages) - 1})，"
+            f"这个AE的encoder/decoder不是对称结构，无法自动配对skip层级"
+        )
+
+    dec_modules = list(base_ae.decoder.conv_layers)
+    levels = []
+    for i in range(1, n_down):          # 跳过 i=0(最外层) 和 i=n_down(bottleneck)
+        dec_j = n_down - i
+        enc_seg = enc_stages[i]
+        # decoder在该分辨率级别的"入口通道数" = 前一段(更小分辨率)处理完的通道数
+        # (Upsample本身不改变通道数，所以入口通道 = 上一段的输出通道数)
+        dec_in_channels = dec_stages[dec_j - 1]["channels"]
+        upsample_idx = dec_stages[dec_j]["slice"][0] - 1   # 触发这次分辨率提升的Upsample模块索引
+
+        if enc_seg["channels"] != dec_in_channels:
+            print(f"[跳过] level{i}: encoder通道{enc_seg['channels']} != "
+                  f"decoder入口通道{dec_in_channels}，架构不对称，无法插入GCN skip")
+            continue
+
+        res = img_size // (2 ** i) if img_size else None
+        name = f"{res}x{res}" if res else f"level{i}"
+
+        next_module = dec_modules[upsample_idx + 1] if upsample_idx + 1 < len(dec_modules) else None
+        if isinstance(next_module, AttnBlock):
+            print(f"[提示] {name}: Upsample之后紧接着一个已有的AttnBlock，"
+                  f"自动插入点在它之前。如果想让GCN插在这个AttnBlock之后，"
+                  f"对返回结果做 spec.dec_insert_after += 1")
+
+        levels.append(SkipLevelSpec(
+            name=name,
+            channels=enc_seg["channels"],
+            enc_slice=enc_seg["slice"],
+            dec_insert_after=upsample_idx,
+            spatial_size=res,
+        ))
+    return levels
+
+
+# ==================== 2. 配置类 ====================
+
+@dataclass
+class GCNBlockConfig:
+    """GraphConvSkipBlock 内部超参数，所有启用的层级共享同一份配置"""
+    zero_init: bool = True                 # True=起点严格等价于base_ae(做对照实验建议保持True)
+    temperature: Optional[float] = None    # None -> 用 channels**-0.5
+    attn_dropout: float = 0.0              # softmax(adj)之后的dropout，防止过拟合到训练集的图结构
+
+
+@dataclass
+class GCNSkipAEConfig:
+    active_levels: Optional[List[str]] = None   # None=启用auto_detect找到的全部层级；
+                                                  # 否则传层级名字列表，如["32x32"]做消融
+    block_cfg: GCNBlockConfig = field(default_factory=GCNBlockConfig)
+    freeze_base: bool = False   # True=冻结除gcn_blocks外的所有参数，只训练新增GCN模块
+
+    quantize_skip: bool = True       # True=skip特征过SkipQuantizer量化成有限bit，而不是原始float
+    skip_quantizer_mode: str = 'learned_v2'  # learned_v2=可学习下/上采样；legacy=旧pool+1x1实现
+    skip_code_channels: int = 8       # 未命中分层配置时的默认通道数
+    skip_code_spatial: int = 8        # 未命中分层配置时的默认空间分辨率
+    # 固定每层2048 bit：64层更强调空间位置，32层保留更多通道语义。
+    skip_level_code_shapes: Dict[str, Tuple[int, int]] = field(default_factory=lambda: {
+        '64x64': (8, 16),
+        '32x32': (32, 8),
+    })
+
+    # Keep the original internal widths when expanding bit channels.
+    skip_hidden_channels: Dict[str, int] = field(default_factory=lambda: {
+        '64x64': 32, '32x32': 64,
+    })
+
+    def code_shape_for(self, level_name: str) -> Tuple[int, int]:
+        shape = self.skip_level_code_shapes.get(
+            level_name, (self.skip_code_channels, self.skip_code_spatial)
+        )
+        return int(shape[0]), int(shape[1])
+
+    def to_json(self, path: str):
+        with open(path, "w") as f:
+            json.dump(asdict(self), f, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, path: str):
+        with open(path) as f:
+            d = json.load(f)
+        d["block_cfg"] = GCNBlockConfig(**d["block_cfg"])
+        return cls(**d)
+
+
+# ==================== 3. GraphConvSkipBlock ====================
+
+class GraphConvSkipBlock(nn.Module):
+    """
+    邻接矩阵由 encoder 特征算出 (self-attention式 QK, 无V)
+    特征矩阵是 decoder 当前层的特征
+    H' = A @ X @ W, zero-init残差接回(可关闭)
+    """
+    def __init__(self, channels: int, cfg: GCNBlockConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.temperature = cfg.temperature if cfg.temperature is not None else channels ** -0.5
+
+        self.norm_enc = Normalize(channels)
+        self.q = nn.Conv2d(channels, channels, 1)
+        self.k = nn.Conv2d(channels, channels, 1)
+        self.gcn_w = nn.Linear(channels, channels)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.attn_dropout = nn.Dropout(cfg.attn_dropout) if cfg.attn_dropout > 0 else nn.Identity()
+
+        if cfg.zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x_dec, feat_enc):
+        B, C, H, W = x_dec.shape
+        h_enc = self.norm_enc(feat_enc)
+        q = self.q(h_enc).reshape(B, C, -1).permute(0, 2, 1)       # (B,N,C)
+        k = self.k(h_enc).reshape(B, C, -1)                         # (B,C,N)
+        adj = torch.softmax(torch.bmm(q, k) * self.temperature, dim=-1)
+        adj = self.attn_dropout(adj)
+
+        x_flat = x_dec.reshape(B, C, -1).permute(0, 2, 1)           # (B,N,C)
+        agg = torch.bmm(adj, x_flat)                                 # A @ X
+        agg = self.gcn_w(agg)                                        # A @ X @ W
+        agg = agg.permute(0, 2, 1).reshape(B, C, H, W)
+
+        return x_dec + self.proj(agg)
+
+
+def _skip_group_count(channels: int) -> int:
+    groups = min(16, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+class SkipQuantizer(nn.Module):
+    """
+    固定bit预算的分层二值skip瓶颈。
+
+    learned_v2使用可学习的3x3 stride卷积下采样，以及bilinear+3x3卷积上采样，
+    避免旧版AdaptiveAvgPool+nearest造成的块状代理特征。legacy模式保留旧结构，
+    仅用于旧checkpoint消融；新训练默认使用learned_v2。
+
+    当前这一步仍只限制skip的信息量，并没有让skip code经过binary diffusion。
+    因此本版本不改变主latent维度，也不要求重训现有diffusion。
+    """
+    def __init__(
+        self, channels: int, code_channels: int = 8, code_spatial: int = 8,
+        source_spatial: Optional[int] = None, mode: str = 'learned_v2',
+        hidden_channels: Optional[int] = None
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.code_channels = int(code_channels)
+        self.code_spatial = int(code_spatial)
+        self.source_spatial = int(source_spatial) if source_spatial is not None else None
+        self.mode = mode
+        self.n_bits = self.code_channels * self.code_spatial * self.code_spatial
+
+        if mode == 'legacy':
+            self.pool = nn.AdaptiveAvgPool2d(self.code_spatial)
+            self.encode_conv = nn.Conv2d(channels, self.code_channels, 1)
+            self.decode_conv = nn.Conv2d(self.code_channels, channels, 1)
+            return
+        if mode != 'learned_v2':
+            raise ValueError(f'未知skip_quantizer_mode: {mode}')
+        if self.source_spatial is None:
+            raise ValueError('learned_v2 SkipQuantizer需要source_spatial')
+        if self.source_spatial < self.code_spatial:
+            raise ValueError('source_spatial不能小于code_spatial')
+        ratio = self.source_spatial // self.code_spatial
+        if self.source_spatial % self.code_spatial != 0 or ratio & (ratio - 1):
+            raise ValueError(
+                f'learned_v2要求source/code为空间2的整数次幂比例，当前'
+                f'{self.source_spatial}/{self.code_spatial}'
+            )
+
+        hidden = (int(hidden_channels) if hidden_channels is not None
+                  else min(channels, max(32, self.code_channels * 8)))
+        if hidden < 1:
+            raise ValueError('hidden_channels must be positive')
+        self.hidden_channels = hidden
+        enc_layers = [
+            nn.Conv2d(channels, hidden, 3, padding=1),
+            nn.GroupNorm(_skip_group_count(hidden), hidden),
+            nn.SiLU(),
+        ]
+        current = self.source_spatial
+        while current > self.code_spatial:
+            enc_layers.extend([
+                nn.Conv2d(hidden, hidden, 3, stride=2, padding=1),
+                nn.GroupNorm(_skip_group_count(hidden), hidden),
+                nn.SiLU(),
+            ])
+            current //= 2
+        enc_layers.append(nn.Conv2d(hidden, self.code_channels, 1))
+        self.encoder_net = nn.Sequential(*enc_layers)
+
+        dec_layers = [
+            nn.Conv2d(self.code_channels, hidden, 3, padding=1),
+            nn.GroupNorm(_skip_group_count(hidden), hidden),
+            nn.SiLU(),
+        ]
+        current = self.code_spatial
+        while current < self.source_spatial:
+            dec_layers.extend([
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(hidden, hidden, 3, padding=1),
+                nn.GroupNorm(_skip_group_count(hidden), hidden),
+                nn.SiLU(),
+            ])
+            current *= 2
+        dec_layers.append(nn.Conv2d(hidden, channels, 3, padding=1))
+        self.decoder_net = nn.Sequential(*dec_layers)
+
+    def encode(self, feat_enc):
+        """feat_enc -> STE二进制码，取值{0,1}。"""
+        if self.mode == 'legacy':
+            logits = self.encode_conv(self.pool(feat_enc))
+        else:
+            logits = self.encoder_net(feat_enc)
+        p = torch.sigmoid(logits)
+        hard = (p > 0.5).float()
+        return p + (hard - p).detach()
+
+    def decode(self, code, spatial_size):
+        if self.mode == 'legacy':
+            h = F.interpolate(code, size=(spatial_size, spatial_size), mode='nearest')
+            return self.decode_conv(h)
+        h = self.decoder_net(code)
+        if h.shape[-2:] != (spatial_size, spatial_size):
+            h = F.interpolate(
+                h, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False
+            )
+        return h
+
+    def forward(self, feat_enc):
+        code = self.encode(feat_enc)
+        feat_proxy = self.decode(code, feat_enc.shape[-1])
+        return feat_proxy, code
+
+
+# ==================== 4. Encoder / Decoder 包装（动态插入，不再手写子模块） ====================
+
+class EncoderGCN(nn.Module):
+    """直接复用原始encoder的conv_layers，逐模块forward，在探测到的每个level边界处记录中间特征"""
+    def __init__(self, base_encoder, levels: List[SkipLevelSpec]):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.levels = levels
+        # 每个level对应"该分辨率处理完、Downsample之前"的模块索引
+        self._hook_at: Dict[int, str] = {lv.enc_slice[1] - 1: lv.name for lv in levels}
+
+    def forward(self, x, hard=True):
+        feats = {}
+        h = x
+        for i, m in enumerate(self.base_encoder.conv_layers):
+            h = m(h)
+            if i in self._hook_at:
+                feats[self._hook_at[i]] = h
+        logits = h
+
+        if not hard:
+            z = torch.sigmoid(logits)
+        else:
+            z_soft = torch.sigmoid(logits)
+            z_hard = (z_soft > 0.5).float()
+            z = z_soft + (z_hard - z_soft).detach()
+        return z, feats
+
+
+class DecoderGCN(nn.Module):
+    """直接复用原始decoder的conv_layers，逐模块forward，在启用的level对应索引后插入GCN block"""
+    def __init__(self, base_decoder, levels: List[SkipLevelSpec], config: GCNSkipAEConfig):
+        super().__init__()
+        self.base_decoder = base_decoder
+        self.config = config
+        active = set(config.active_levels) if config.active_levels is not None else None
+
+        self.gcn_blocks = nn.ModuleDict()
+        self.skip_quantizers = nn.ModuleDict()   # 只有 quantize_skip=True 时才会有内容
+        self._insert_after: Dict[int, str] = {}
+        for lv in levels:
+            if active is not None and lv.name not in active:
+                continue
+            self.gcn_blocks[lv.name] = GraphConvSkipBlock(lv.channels, config.block_cfg)
+            if config.quantize_skip:
+                code_channels, code_spatial = config.code_shape_for(lv.name)
+                self.skip_quantizers[lv.name] = SkipQuantizer(
+                    lv.channels,
+                    code_channels=code_channels,
+                    code_spatial=code_spatial,
+                    source_spatial=lv.spatial_size,
+                    mode=config.skip_quantizer_mode,
+                    hidden_channels=config.skip_hidden_channels.get(lv.name),
+                )
+            self._insert_after[lv.dec_insert_after] = lv.name
+
+    def forward(self, z, enc_feats: Dict[str, torch.Tensor]):
+        h = z
+        for i, m in enumerate(self.base_decoder.conv_layers):
+            h = m(h)
+            if i in self._insert_after:
+                name = self._insert_after[i]
+                feat = enc_feats[name]
+                if name in self.skip_quantizers:
+                    feat, _code = self.skip_quantizers[name](feat)   # 量化+解码成代理特征
+                h = self.gcn_blocks[name](h, feat)
+        return h
+
+
+    def forward_from_codes(self, z, skip_codes: Dict[str, torch.Tensor]):
+        """最终联合净化路径：只接收main latent和显式skip bits，不再读取原始encoder特征。"""
+        expected = set(self.gcn_blocks.keys())
+        missing = expected - set(skip_codes.keys())
+        if missing:
+            raise KeyError(f'缺少已净化skip code: {sorted(missing)}')
+
+        h = z.float()
+        for i, m in enumerate(self.base_decoder.conv_layers):
+            h = m(h)
+            if i in self._insert_after:
+                name = self._insert_after[i]
+                quantizer = self.skip_quantizers[name]
+                code = skip_codes[name].float()
+                feature = quantizer.decode(code, quantizer.source_spatial)
+                h = self.gcn_blocks[name](h, feature)
+        return h
+
+    def skip_bit_budget(self) -> int:
+        """这个decoder里所有量化skip层级加起来一共用了多少bit(quantize_skip=False时返回0)"""
+        return sum(q.n_bits for q in self.skip_quantizers.values())
+
+
+# ==================== 5. 完整模型 ====================
+
+class BinaryAutoEncoderGCN(nn.Module):
+    def __init__(self, base_ae, config: Optional[GCNSkipAEConfig] = None,
+                 levels: Optional[List[SkipLevelSpec]] = None,
+                 img_size: Optional[int] = None):
+        super().__init__()
+        self.config = config or GCNSkipAEConfig()
+        img_size = img_size or getattr(bld, "IMG_SIZE", None)
+        self.levels = levels if levels is not None else auto_detect_skip_levels(base_ae, img_size)
+
+        self.encoder = EncoderGCN(base_ae.encoder, self.levels)
+        self.decoder = DecoderGCN(base_ae.decoder, self.levels, self.config)
+        self.latent_h = base_ae.latent_h
+        self.latent_w = base_ae.latent_w
+        self.D = base_ae.D
+
+        if self.config.freeze_base:
+            self._freeze_non_gcn_params()
+
+    def _freeze_non_gcn_params(self):
+        n_frozen = 0
+        for name, p in self.named_parameters():
+            if "gcn_blocks" not in name:
+                p.requires_grad = False
+                n_frozen += p.numel()
+        print(f"[freeze_base=True] 已冻结 {n_frozen:,} 个非GCN参数，仅GCN模块可训练")
+
+    def encode_binary(self, x):
+        with torch.no_grad():
+            z, _ = self.encoder(x, hard=True)
+        return z.long().view(z.shape[0], -1)
+
+    def encode_with_feats(self, x):
+        """和encode_binary类似，但同时返回GCN decoder需要的encoder中间特征。
+        净化评估这类场景需要单独decode一个被攻击/净化过的z(而不是走完整的forward(x))，
+        这时候decode必须配上对应的encoder特征，所以拆出这个方法。"""
+        with torch.no_grad():
+            z, feats = self.encoder(x, hard=True)
+        return z.long().view(z.shape[0], -1), feats
+
+    def decode(self, z_flat, enc_feats):
+        """解码一个(可能是被攻击/净化过的)binary latent。
+        注意：enc_feats必须来自某张干净图片的encode_with_feats，因为GCN的邻接矩阵
+        依赖它。也就是说这个架构没法做到"只靠传输的bit就能解码"——接收端必须额外
+        持有一份对应的encoder特征。这在离线评估(z和干净图配对已知)里没问题，但如果
+        以后要做真实的"压缩后传输、接收端只有bit"部署场景，这是需要另外处理的架构限制，
+        不是这次净化评估要解决的问题，先在这里提醒一下。"""
+        B = z_flat.shape[0]
+        n_latent_ch = self.D // (self.latent_h * self.latent_w)
+        z = z_flat.view(B, n_latent_ch, self.latent_h, self.latent_w).float()
+        return self.decoder(z, enc_feats)
+
+    def forward(self, x):
+        z, feats = self.encoder(x, hard=True)
+        x_rec = self.decoder(z, feats)
+        return x_rec, z
+
+
+    def encode_all_codes(self, x, hard=True):
+        """编码6144-bit表示：2048-bit main + 两路各2048-bit skip。"""
+        z, features = self.encoder(x, hard=hard)
+        skip_codes = {
+            name: quantizer.encode(features[name])
+            for name, quantizer in self.decoder.skip_quantizers.items()
+        }
+        return z, skip_codes
+
+    def decode_from_codes(self, z, skip_codes):
+        """从净化后的显式bits解码；这是joint diffusion应使用的唯一decoder入口。"""
+        return self.decoder.forward_from_codes(z, skip_codes)
+
+    def total_bit_budget(self) -> int:
+        """主传输bit(self.D) + 所有量化skip层级的bit，是这个模型诚实的总比特预算。
+        quantize_skip=False时，skip_bit_budget()恒为0，total就等于self.D(和v4一致)。"""
+        return self.D + self.decoder.skip_bit_budget()
+
+    def summary(self):
+        n_total = sum(p.numel() for p in self.parameters())
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_gcn = sum(p.numel() for n, p in self.named_parameters() if "gcn_blocks" in n)
+        skip_bits = self.decoder.skip_bit_budget()
+        print(f"检测到的可用skip层级: {[lv.name for lv in self.levels]}")
+        print(f"实际启用: {list(self.decoder.gcn_blocks.keys())}")
+        print(f"总参数量: {n_total:,}  可训练: {n_trainable:,}  GCN新增: {n_gcn:,}")
+        print(f"zero_init={self.config.block_cfg.zero_init}  temperature={self.config.block_cfg.temperature}  "
+              f"attn_dropout={self.config.block_cfg.attn_dropout}  freeze_base={self.config.freeze_base}")
+        if self.config.quantize_skip:
+            for name, quantizer in self.decoder.skip_quantizers.items():
+                print(
+                    f'  skip {name}: mode={quantizer.mode}, '
+                    f'code={quantizer.code_channels}x{quantizer.code_spatial}x{quantizer.code_spatial} '
+                    f'= {quantizer.n_bits} bit'
+                )
+            print(f"比特预算: 主传输 {self.D} bit + skip量化 {skip_bits} bit "
+                  f"= 总计 {self.total_bit_budget()} bit "
+                  f"(相比纯2048bit的v4，多了 {skip_bits} bit 的显式辅助信息)")
+        else:
+            print(f"比特预算: 主传输 {self.D} bit (skip特征未量化，仍是未计量的float，"
+                  f"不能报告为固定bit数——如果要一个诚实的总预算数字，"
+                  f"把GCNSkipAEConfig(quantize_skip=True)打开)")
+
+
+# ==================== 6. 工厂函数 ====================
+
+def build_gcn_ae(base_ae, config: Optional[GCNSkipAEConfig] = None,
+                  levels: Optional[List[SkipLevelSpec]] = None,
+                  img_size: Optional[int] = None) -> BinaryAutoEncoderGCN:
+    model = BinaryAutoEncoderGCN(base_ae, config, levels, img_size).to(bld.DEVICE)
+    model.summary()
+    return model
+
+
+def _unwrap_gcn_state_dict(raw):
+    if isinstance(raw, dict) and 'model_state_dict' in raw:
+        return raw['model_state_dict']
+    if isinstance(raw, dict) and 'state_dict' in raw:
+        return raw['state_dict']
+    return raw
+
+
+def warm_start_learned_skip_from_legacy(model, checkpoint_path: str):
+    """
+    从旧8x8x8 pool量化器checkpoint热启动learned_v2。
+    复用所有名称和shape一致的encoder/base decoder/GCN权重；旧skip量化器不加载。
+    由于新量化器初始代理特征分布不同，GCN残差proj重新归零，保证起点稳定。
+    """
+    raw = torch.load(checkpoint_path, map_location=bld.DEVICE)
+    source = _unwrap_gcn_state_dict(raw)
+    target = model.state_dict()
+    compatible = {}
+    skipped = []
+    for name, value in source.items():
+        if 'skip_quantizers' in name:
+            skipped.append(name)
+            continue
+        if name in target and target[name].shape == value.shape:
+            compatible[name] = value
+        else:
+            skipped.append(name)
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    for block in model.decoder.gcn_blocks.values():
+        nn.init.zeros_(block.proj.weight)
+        nn.init.zeros_(block.proj.bias)
+    print(
+        f'learned_v2热启动: 复用{len(compatible)}个tensor，跳过{len(skipped)}个旧tensor；'
+        f'新结构待训练tensor={len(missing)}，unexpected={len(unexpected)}'
+    )
+    print('已将GCN proj重新zero-init，防止随机新skip量化器在训练前破坏base decoder输出')
+    return model
+
+
+# ==================== 7. 训练循环（两阶段：ae_only -> 接det_loss） ====================
+
+@dataclass
+class TrainConfig:
+    epochs_ae_only: int = 10        # 阶段1：只用MSE+binary正则，先验证GCN架构本身有效
+    epochs_with_det: int = 10       # 阶段2：接入det_loss联合训练；设0则只跑阶段1
+    lr: float = 1e-4
+    det_loss_weight: float = 0.1    # λ，对应你CRIS里det_loss的权重
+    det_warm_start_epochs: int = 3  # det_loss权重从0线性warm-start到det_loss_weight所用的epoch数
+    bin_reg_weight: float = 0.01    # 和bld.py的train_autoencoder保持一致
+    ckpt_path: str = "gcn_ae_ckpt.pt"        # 本地路径(快，每次保存都写这里)
+    drive_backup_path: Optional[str] = None  # 如果设了，每次保存最优checkpoint时额外同步一份到这里，
+                                              # 并验证复制成功(存在+大小一致)。强烈建议在Colab里设成
+                                              # Drive路径，比如 '/content/drive/MyDrive/xxx/gcn_ae_ckpt.pt'
+
+
+def save_ckpt_safely(model, ckpt_path: str, drive_backup_path: Optional[str] = None):
+    """
+    先存本地(快、不受Drive同步延迟影响)，如果指定了drive_backup_path，
+    再显式复制过去并验证(文件存在 + 大小一致)，验证失败会抛错而不是静默失败——
+    这样"看起来存了但其实没同步"这种情况会在训练时就报错，而不是等断连之后才发现。
+    """
+    torch.save(model.state_dict(), ckpt_path)
+    if drive_backup_path is None:
+        return
+    os.makedirs(os.path.dirname(drive_backup_path), exist_ok=True)
+    shutil.copy(ckpt_path, drive_backup_path)
+    local_size = os.path.getsize(ckpt_path)
+    drive_size = os.path.getsize(drive_backup_path)
+    if drive_size != local_size:
+        raise RuntimeError(
+            f"Drive备份校验失败: 本地{local_size}字节 vs Drive{drive_size}字节，"
+            f"可能是Drive同步没跟上，请重新保存或检查Drive挂载状态"
+        )
+    print(f"    ✓ 已同步到Drive: {drive_backup_path} ({drive_size / 1e6:.1f} MB)")
+
+
+def evaluate_gcn_ae(model, loader, n_batches=5):
+    """和bld.evaluate_ae同样的PSNR评估方式，适配GCN模型forward返回(x_rec, z)的签名"""
+    model.eval()
+    psnrs = []
+    with torch.no_grad():
+        for i, (x, _) in enumerate(loader):
+            if i >= n_batches:
+                break
+            x = x.to(bld.DEVICE)
+            x_rec, _ = model(x)
+            mse = F.mse_loss(x_rec, x, reduction='none').mean(dim=(1, 2, 3))
+            psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
+            psnrs.append(psnr)
+    return float(np.mean(psnrs))
+
+
+def train_gcn_ae(model, train_loader, test_loader, train_cfg: TrainConfig,
+                  det_loss_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None):
+    """
+    两阶段训练：
+      阶段1 (epochs_ae_only): 只用 MSE + binary正则，先确认GCN架构本身在ae_only层面有效，
+                               对应你一贯的"先ae_only验证，再接完整pipeline"的习惯。
+      阶段2 (epochs_with_det): 如果传入了det_loss_fn，在阶段1基础上继续训练，
+                               det_loss权重从0线性warm-start到train_cfg.det_loss_weight。
+    如果 det_loss_fn=None，只跑阶段1(纯重建，不接检测loss)。
+    如果 model 是用 freeze_base=True 构建的，optimizer只会拿到requires_grad=True的
+    那部分参数(也就是GCN新增模块)，不需要手动过滤。
+
+    det_loss_fn 签名: det_loss_fn(x_rec, x_orig) -> scalar tensor
+    (比如你CRIS pipeline里接YOLOv8n算检测特征loss的那个函数，直接传进来即可)
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.Adam(params, lr=train_cfg.lr)
+    total_epochs = train_cfg.epochs_ae_only + train_cfg.epochs_with_det
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(total_epochs, 1))
+
+    best_psnr = 0.0
+    epoch_idx = 0
+
+    def run_epoch(use_det_loss, det_weight):
+        nonlocal epoch_idx
+        model.train()
+        total_loss, n = 0.0, 0
+        for x, _ in tqdm(train_loader, desc=f"epoch {epoch_idx + 1}/{total_epochs}", leave=False):
+            x = x.to(bld.DEVICE)
+            x_rec, z = model(x)
+
+            mse = F.mse_loss(x_rec, x)
+            z_soft = z.float()
+            bin_reg = -(z_soft * torch.log(z_soft + 1e-6) +
+                        (1 - z_soft) * torch.log(1 - z_soft + 1e-6)).mean()
+            loss = mse + train_cfg.bin_reg_weight * bin_reg
+
+            if use_det_loss and det_loss_fn is not None:
+                loss = loss + det_weight * det_loss_fn(x_rec, x)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+
+            total_loss += loss.item() * x.shape[0]
+            n += x.shape[0]
+
+        scheduler.step()
+        avg_loss = total_loss / max(n, 1)
+        psnr = evaluate_gcn_ae(model, test_loader)
+        det_str = f"  det_weight={det_weight:.4f}" if use_det_loss else ""
+        print(f"  epoch {epoch_idx + 1}/{total_epochs}  loss={avg_loss:.4f}  PSNR={psnr:.2f}dB{det_str}")
+        epoch_idx += 1
+        return psnr
+
+    print(f"=== 阶段1: ae_only ({train_cfg.epochs_ae_only} epochs) ===")
+    for _ in range(train_cfg.epochs_ae_only):
+        psnr = run_epoch(use_det_loss=False, det_weight=0.0)
+        if psnr > best_psnr:
+            best_psnr = psnr
+            save_ckpt_safely(model, train_cfg.ckpt_path, train_cfg.drive_backup_path)
+            print(f"    √ checkpoint saved (best PSNR={best_psnr:.2f}dB)")
+
+    if train_cfg.epochs_with_det > 0 and det_loss_fn is not None:
+        print(f"=== 阶段2: 接入det_loss，warm-start {train_cfg.det_warm_start_epochs} epochs ===")
+        for e in range(train_cfg.epochs_with_det):
+            warm_frac = min(1.0, (e + 1) / max(train_cfg.det_warm_start_epochs, 1))
+            det_weight = train_cfg.det_loss_weight * warm_frac
+            psnr = run_epoch(use_det_loss=True, det_weight=det_weight)
+            if psnr > best_psnr:
+                best_psnr = psnr
+                save_ckpt_safely(model, train_cfg.ckpt_path, train_cfg.drive_backup_path)
+                print(f"    √ checkpoint saved (best PSNR={best_psnr:.2f}dB)")
+    elif train_cfg.epochs_with_det > 0 and det_loss_fn is None:
+        print("[提示] epochs_with_det>0但没有传入det_loss_fn，跳过阶段2")
+
+    print(f"训练完成。最佳PSNR: {best_psnr:.2f}dB，checkpoint保存在 {train_cfg.ckpt_path}")
+    model.load_state_dict(torch.load(train_cfg.ckpt_path, map_location=bld.DEVICE))
+    return model
+
+
+# ==================== 8. mAP评估（对接现有的YOLOv8n eval） ====================
+
+def save_as_dfire_split(x_batch, paths, save_dir):
+    """把一个batch的重建图像存成D-Fire格式的images/+labels/，label从原图对应的.txt复制过来。
+    (原样保留，未改动)"""
+    os.makedirs(f"{save_dir}/images", exist_ok=True)
+    os.makedirs(f"{save_dir}/labels", exist_ok=True)
+    for img, p in zip(x_batch, paths):
+        name = os.path.basename(p).rsplit('.', 1)[0]
+        T.ToPILImage()(img.cpu()).save(f"{save_dir}/images/{name}.jpg")
+        lp = p.replace('/images/', '/labels/').rsplit('.', 1)[0] + '.txt'
+        if os.path.exists(lp):
+            shutil.copy(lp, f"{save_dir}/labels/{name}.txt")
+
+
+def eval_map(save_dir, img_size=384, detector=None):
+    """(原样保留，只是把detector从隐式全局变量改成显式参数，避免这个脚本单独运行时
+    依赖notebook里才有的全局状态；不传的话会尝试从全局作用域找)"""
+    if detector is None:
+        detector = globals().get("detector")
+        assert detector is not None, "需要传入detector参数，或在全局作用域定义好detector(YOLOv8n模型)"
+    yaml_path = f"{save_dir}/tmp.yaml"
+    with open(yaml_path, 'w') as f:
+        yaml.dump({'path': save_dir, 'train': 'images', 'val': 'images',
+                   'names': {0: 'fire', 1: 'smoke'}}, f)
+    m = detector.val(data=yaml_path, imgsz=img_size, verbose=False)
+    return m.box.map50, m.box.map
+
+
+def evaluate_gcn_ae_map(model, dataset, detector, save_dir="/tmp/gcn_ae_map_eval",
+                         batch_size=16, n_samples=None, img_size=384):
+    """
+    对model重建后的图像跑一次真实mAP评估，复用上面的save_as_dfire_split + eval_map。
+
+    dataset 需要有 .paths(图片路径列表) 和 .tf(预处理transform)，也就是直接传
+    bld.DFireDataset 的实例，不是DataLoader —— 因为mAP评估需要知道每张图对应哪个
+    label文件，这个对应关系只在 dataset.paths 里有，DataLoader batch出来的tensor
+    丢失了这个信息，所以这里按 dataset.paths 手动分batch，不经过DataLoader。
+
+    n_samples: 只评估前n_samples张图。mAP评估比PSNR慢很多(要存图+跑一次完整YOLO val)，
+    调试阶段建议先设小一点，比如n_samples=200，确认流程通了再上全量测试集。
+    """
+    model.eval()
+    if os.path.exists(save_dir):
+        shutil.rmtree(save_dir)   # 清空，避免和上一次评估的残留图混在一起
+
+    paths = dataset.paths if n_samples is None else dataset.paths[:n_samples]
+
+    with torch.no_grad():
+        for start in range(0, len(paths), batch_size):
+            batch_paths = paths[start:start + batch_size]
+            x_batch = torch.stack(
+                [dataset.tf(Image.open(p).convert("RGB")) for p in batch_paths]
+            ).to(bld.DEVICE)
+            x_rec, _ = model(x_batch)
+            save_as_dfire_split(x_rec, batch_paths, save_dir)
+
+    map50, map5095 = eval_map(save_dir, img_size=img_size, detector=detector)
+    print(f"[mAP eval] map50={map50:.4f}  map50-95={map5095:.4f}  "
+          f"(n={len(paths)}, save_dir={save_dir})")
+    return map50, map5095
+
+
+# ==================== 9. mAP口径的净化评估（攻击→净化→解码→检测） ====================
+
+def evaluate_purification_map(
+        diff_model, ae, dataset, detector, betas, flip_prob,
+        flip_rates=None, t_stars=None,
+        n_samples=200, batch_size=16, img_size=384,
+        save_dir_root="/content/eval_purify_map"):
+    """
+    mAP口径的净化评估，和bld.evaluate用同一套攻击模拟方式(binary latent空间的bit-flip腐蚀)，
+    只是把bit accuracy换成真实mAP，方便和你v1-v4的purification recovery ratio对齐比较。
+
+    如果你要的是真实PGD攻击(pixel空间对YOLOv8n loss求梯度)而不是这里的bit-flip，这个函数
+    不适用，需要另外写一版——把你CRIS pipeline里那部分PGD代码发我，我可以在攻击这一步替换掉，
+    net化→解码→检测的部分可以直接复用。
+
+    重要架构提醒：因为GCN skip的邻接矩阵依赖encoder中间特征，decode一个被攻击/净化过的z时，
+    这里用的是"同一张干净图片自己的encoder特征"配对解码——不是模拟"接收端只有bit、没有原图"
+    的真实部署场景。这对离线评估"净化能不能把mAP拉回来"是合理的(z和干净图本来就是配对已知的)，
+    但如果你以后要写"这套架构能不能真的部署"这类结论，这个前提需要额外说明。
+
+    n_samples: 网格是 (1 + len(flip_rates)*(1+len(t_stars))) 次完整YOLO val，
+    默认flip_rates/t_stars(4×5)算下来是25次，比较慢。调试阶段强烈建议先传小一点的
+    flip_rates=[0.1]、t_stars=[10,40]、n_samples=50 跑通流程，确认没问题再上完整网格。
+
+    返回: {"clean": (map50,map), "attacked_fr0.1": (map50,map),
+           "purified_fr0.1_t10": (map50,map), ...}
+    """
+    diff_model.eval()
+    ae.eval()
+    flip_rates = flip_rates if flip_rates is not None else bld.FLIP_RATES
+    t_stars = t_stars if t_stars is not None else bld.T_STARS
+    paths = dataset.paths[:n_samples]
+
+    dirs = {"clean": f"{save_dir_root}/clean"}
+    for fr in flip_rates:
+        dirs[f"attacked_fr{fr}"] = f"{save_dir_root}/attacked_fr{fr}"
+        for t in t_stars:
+            dirs[f"purified_fr{fr}_t{t}"] = f"{save_dir_root}/purified_fr{fr}_t{t}"
+
+    for d in dirs.values():
+        if os.path.exists(d):
+            shutil.rmtree(d)
+
+    print(f"共 {len(dirs)} 组配置 × {len(paths)} 张图，开始生成重建图像...")
+    with torch.no_grad():
+        for start in range(0, len(paths), batch_size):
+            batch_paths = paths[start:start + batch_size]
+            x = torch.stack(
+                [dataset.tf(Image.open(p).convert("RGB")) for p in batch_paths]
+            ).to(bld.DEVICE)
+
+            z_clean, feats = ae.encode_with_feats(x)
+
+            x_rec_clean = ae.decode(z_clean, feats)
+            save_as_dfire_split(x_rec_clean, batch_paths, dirs["clean"])
+
+            for fr in flip_rates:
+                z_adv = ((z_clean.float() +
+                          torch.bernoulli(torch.full_like(z_clean.float(), fr))) % 2).long()
+
+                x_rec_adv = ae.decode(z_adv, feats)
+                save_as_dfire_split(x_rec_adv, batch_paths, dirs[f"attacked_fr{fr}"])
+
+                for t_star in t_stars:
+                    t_vec = torch.full((z_adv.shape[0],), t_star - 1,
+                                        device=bld.DEVICE, dtype=torch.long)
+                    z_noised = bld.q_sample(z_adv, t_vec, flip_prob)
+                    z_rec = bld.reverse(diff_model, z_noised, t_star, betas, flip_prob)
+                    x_rec_purified = ae.decode(z_rec, feats)
+                    save_as_dfire_split(x_rec_purified, batch_paths,
+                                         dirs[f"purified_fr{fr}_t{t_star}"])
+
+    print("图像生成完毕，开始跑YOLO验证...")
+    results = {}
+    results["clean"] = eval_map(dirs["clean"], img_size=img_size, detector=detector)
+    print(f"  [clean]  map50={results['clean'][0]:.4f}  map={results['clean'][1]:.4f}")
+
+    for fr in flip_rates:
+        key = f"attacked_fr{fr}"
+        results[key] = eval_map(dirs[key], img_size=img_size, detector=detector)
+        m50, m = results[key]
+        print(f"  [attacked fr={fr:.0%}]  map50={m50:.4f}  map={m:.4f}")
+
+        for t_star in t_stars:
+            key = f"purified_fr{fr}_t{t_star}"
+            results[key] = eval_map(dirs[key], img_size=img_size, detector=detector)
+            m50, m = results[key]
+            print(f"    [purified fr={fr:.0%} t*={t_star}]  map50={m50:.4f}  map={m:.4f}")
+
+    return results
+
+
+# ==================== 10. Clean task-aware 微调：提高干净重建mAP上限 ====================
+
+@dataclass
+class CleanTaskAwareConfig:
+    epochs: int = 6
+    batch_size: int = 8
+    lr: float = 5e-5
+    new_module_lr_multiplier: float = 2.0  # learned quantizer/GCN从新起点学习得更快
+    weight_decay: float = 1e-4
+    rec_l1_weight: float = 0.7
+    rec_mse_weight: float = 0.3
+    det_loss_weight: float = 0.01
+    det_box_gain: float = 7.5   # Ultralytics detection loss默认box增益
+    det_cls_gain: float = 0.5   # Ultralytics detection loss默认cls增益
+    det_dfl_gain: float = 1.5   # Ultralytics detection loss默认dfl增益
+    det_warmup_epochs: int = 3
+    grad_clip: float = 1.0
+    num_workers: int = 2
+    max_train_batches: Optional[int] = None  # 调试可设20；正式训练保持None
+    map_eval_samples: Optional[int] = None  # None=每个epoch用完整test split按mAP选优
+    map_eval_batch_size: int = 16
+    map_eval_dir: str = '/content/gcn_skip_learned_v2_map_eval'
+    detector_ckpt: str = '/content/drive/MyDrive/dfire_checkpoints/yolov8n_dfire_detector.pt'
+    local_ckpt: str = '/content/gcn_skip6144_taskaware_best.pt'
+    drive_ckpt: str = '/content/drive/MyDrive/gcn_ae_checkpoints/skip_6144_from_v3/gcn_skip6144_taskaware_best.pt'
+    eval_before_train: bool = True
+
+
+class _LossAttrDict(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+def _sanitize_det_targets(targets, device):
+    targets = {k: v.to(device) for k, v in targets.items()}
+    boxes = targets['bboxes']
+    if boxes.numel() == 0:
+        return targets, 0
+    valid = torch.isfinite(boxes).all(dim=1)
+    valid &= ((boxes >= 0.0) & (boxes <= 1.0)).all(dim=1)
+    dropped = int((~valid).sum().item())
+    if dropped:
+        targets['bboxes'] = targets['bboxes'][valid]
+        targets['cls'] = targets['cls'][valid]
+        targets['batch_idx'] = targets['batch_idx'][valid]
+    return targets, dropped
+
+
+def train_gcn_clean_taskaware(model, cfg: CleanTaskAwareConfig):
+    """
+    冻结encoder，只微调base decoder、GCN blocks和skip quantizer。
+    目标是直接提高 clean_reconstructed mAP，同时保持binary latent接口不变。
+    checkpoint按clean reconstructed mAP50选优，不再按PSNR选优。
+    """
+    from torch.utils.data import DataLoader
+    from ultralytics import YOLO
+    from ultralytics.utils.loss import v8DetectionLoss
+
+    if not os.path.exists(cfg.detector_ckpt):
+        raise FileNotFoundError(f'找不到检测器权重: {cfg.detector_ckpt}')
+
+    # 冻结encoder，避免改变现有latent分布；decoder/GCN/skip量化器保持可训练。
+    for p in model.encoder.parameters():
+        p.requires_grad_(False)
+    for p in model.decoder.parameters():
+        p.requires_grad_(True)
+    trainable_named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    trainable = [p for _n, p in trainable_named]
+    if not trainable:
+        raise RuntimeError('没有可训练的decoder/GCN参数')
+    new_module_params = [
+        p for n, p in trainable_named
+        if 'decoder.gcn_blocks' in n or 'decoder.skip_quantizers' in n
+    ]
+    new_module_ids = {id(p) for p in new_module_params}
+    base_decoder_params = [p for p in trainable if id(p) not in new_module_ids]
+    print(
+        f'任务感知微调：encoder冻结，总训练参数={sum(p.numel() for p in trainable):,}；'
+        f'base decoder={sum(p.numel() for p in base_decoder_params):,}，'
+        f'GCN+learned skip={sum(p.numel() for p in new_module_params):,}'
+    )
+
+    # 384输入用于YOLO；同一张图内部降到128送入GCN AE。
+    train_ds = DFireDetDataset(bld.DFIRE_ROOT, split='train', size=384)
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=True, collate_fn=det_collate
+    )
+    map_ds = bld.DFireDataset(bld.DFIRE_ROOT, split='test', size=bld.IMG_SIZE)
+    print(f'任务感知训练集={len(train_ds)}，clean mAP验证集={len(map_ds)}')
+
+    # loss_detector参数冻结，但保留对输入x_rec_384的梯度。
+    loss_yolo = YOLO(cfg.detector_ckpt)
+    loss_yolo.model.to(bld.DEVICE)
+    loss_yolo.model.train()
+    for p in loss_yolo.model.parameters():
+        p.requires_grad_(False)
+    for module in loss_yolo.model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+    det_criterion = v8DetectionLoss(loss_yolo.model)
+    det_hyp_defaults = {
+        'box': cfg.det_box_gain, 'cls': cfg.det_cls_gain, 'dfl': cfg.det_dfl_gain
+    }
+    if isinstance(det_criterion.hyp, dict):
+        hyp = _LossAttrDict(det_criterion.hyp)
+        for key, value in det_hyp_defaults.items():
+            hyp.setdefault(key, value)
+        det_criterion.hyp = hyp
+    else:
+        for key, value in det_hyp_defaults.items():
+            if not hasattr(det_criterion.hyp, key):
+                setattr(det_criterion.hyp, key, value)
+    print(
+        '检测损失增益:',
+        f'box={det_criterion.hyp.box}, cls={det_criterion.hyp.cls}, dfl={det_criterion.hyp.dfl}'
+    )
+
+    eval_detector = YOLO(cfg.detector_ckpt)
+    optimizer_groups = []
+    if base_decoder_params:
+        optimizer_groups.append({'params': base_decoder_params, 'lr': cfg.lr})
+    if new_module_params:
+        optimizer_groups.append({
+            'params': new_module_params,
+            'lr': cfg.lr * cfg.new_module_lr_multiplier,
+        })
+    optimizer = torch.optim.AdamW(
+        optimizer_groups, lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(cfg.epochs, 1)
+    )
+
+    best_map50 = -1.0
+    if cfg.eval_before_train:
+        baseline_map50, baseline_map = evaluate_gcn_ae_map(
+            model, map_ds, eval_detector, save_dir=cfg.map_eval_dir,
+            batch_size=cfg.map_eval_batch_size, n_samples=cfg.map_eval_samples,
+            img_size=384,
+        )
+        best_map50 = baseline_map50
+        save_ckpt_safely(model, cfg.local_ckpt, cfg.drive_ckpt)
+        print(f'微调前clean reconstructed: mAP50={baseline_map50:.4f}, mAP50-95={baseline_map:.4f}')
+
+    for epoch in range(cfg.epochs):
+        model.train()
+        model.encoder.eval()
+        det_weight = cfg.det_loss_weight * min(
+            1.0, (epoch + 1) / max(cfg.det_warmup_epochs, 1)
+        )
+        total_loss = total_l1 = total_mse = total_det = 0.0
+        seen = dropped_boxes = 0
+
+        for batch_i, (x_384, targets, _paths) in enumerate(
+            tqdm(train_loader, desc=f'clean-task epoch {epoch + 1}/{cfg.epochs}', leave=False)
+        ):
+            if cfg.max_train_batches is not None and batch_i >= cfg.max_train_batches:
+                break
+            x_384 = x_384.to(bld.DEVICE, non_blocking=True)
+            x_128 = F.interpolate(
+                x_384, size=bld.IMG_SIZE, mode='bilinear', align_corners=False
+            )
+
+            with torch.no_grad():
+                z, enc_feats = model.encoder(x_128, hard=True)
+                z = z.detach()
+                enc_feats = {k: v.detach() for k, v in enc_feats.items()}
+            x_rec_128 = model.decoder(z, enc_feats)
+            l1 = F.l1_loss(x_rec_128, x_128)
+            mse = F.mse_loss(x_rec_128, x_128)
+            rec_loss = cfg.rec_l1_weight * l1 + cfg.rec_mse_weight * mse
+
+            x_rec_384 = F.interpolate(
+                x_rec_128, size=384, mode='bilinear', align_corners=False
+            )
+            clean_targets, dropped = _sanitize_det_targets(targets, bld.DEVICE)
+            dropped_boxes += dropped
+            preds = loss_yolo.model(x_rec_384)
+            det_vec, _det_items = det_criterion(preds, clean_targets)
+            det_loss = det_vec.sum() / max(x_384.shape[0], 1)
+            loss = rec_loss + det_weight * det_loss
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+            optimizer.step()
+
+            batch_n = x_384.shape[0]
+            seen += batch_n
+            total_loss += loss.item() * batch_n
+            total_l1 += l1.item() * batch_n
+            total_mse += mse.item() * batch_n
+            total_det += det_loss.item() * batch_n
+
+        scheduler.step()
+        if seen == 0:
+            raise RuntimeError('任务感知训练没有读取到任何batch')
+        avg_l1 = total_l1 / seen
+        avg_mse = total_mse / seen
+        avg_rec = cfg.rec_l1_weight * avg_l1 + cfg.rec_mse_weight * avg_mse
+        avg_det = total_det / seen
+        avg_weighted_det = det_weight * avg_det
+        det_rec_ratio = avg_weighted_det / max(avg_rec, 1e-12)
+        print(
+            f'epoch {epoch + 1}/{cfg.epochs}  loss={total_loss/seen:.4f}  '
+            f'L1={avg_l1:.4f}  MSE={avg_mse:.4f}  rec={avg_rec:.4f}  '
+            f'det={avg_det:.4f}  det_weight={det_weight:.5f}  '
+            f'weighted_det={avg_weighted_det:.4f}  det/rec={det_rec_ratio:.2f}x  '
+            f'dropped_invalid_boxes={dropped_boxes}'
+        )
+
+        map50, map5095 = evaluate_gcn_ae_map(
+            model, map_ds, eval_detector, save_dir=cfg.map_eval_dir,
+            batch_size=cfg.map_eval_batch_size, n_samples=cfg.map_eval_samples,
+            img_size=384,
+        )
+        if map50 > best_map50:
+            best_map50 = map50
+            save_ckpt_safely(model, cfg.local_ckpt, cfg.drive_ckpt)
+            print(f'    ✓ clean reconstructed mAP50提升，保存best={best_map50:.4f}')
+        else:
+            print(f'    clean reconstructed mAP50未提升：current={map50:.4f}, best={best_map50:.4f}')
+
+    model.load_state_dict(torch.load(cfg.local_ckpt, map_location=bld.DEVICE), strict=True)
+    model.eval()
+    print(f'clean task-aware微调结束，best mAP50={best_map50:.4f}')
+    print('最佳权重:', cfg.drive_ckpt)
+    return model

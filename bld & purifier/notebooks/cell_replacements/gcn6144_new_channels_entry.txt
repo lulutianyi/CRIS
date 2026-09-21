@@ -1,0 +1,23 @@
+# [独立实验] Robust-v3保输出扩容；只训练新增bit通道
+# 上传 methods/gcn6144_new_channels.py 到 /content/methods 后运行。
+# 前面的ADAPT/JOINT训练开关保持False；本入口不使用它们的权重。
+%run -i /content/methods/gcn6144_new_channels.py
+
+RUN_NEW_CHANNELS_SMOKE = False
+RUN_NEW_CHANNELS_PILOT = False
+
+if RUN_NEW_CHANNELS_SMOKE:
+    new_channels_smoke = train_new_channels(NewChannelsConfig())
+
+if RUN_NEW_CHANNELS_PILOT:
+    new_channels_model = train_new_channels(NewChannelsConfig(
+        epochs=2, max_train_batches=500, batch_size=2, lr=2e-5,
+        output_dir=(
+            "/content/drive/MyDrive/gcn_ae_checkpoints/"
+            "skip6144_from_robustv3_newchannels/pilot_2x500"
+        ),
+    ))
+# Saved files: epoch1.pt, epoch2.pt, experiment.json.
+# Evaluate with make_gcn6144(checkpoint, resume6144=True).
+# Same-subset baseline must use NewChannelsConfig().source (Robust-v3),
+# not SOURCE_3072_CKPT (the earlier Learned-v2 model).
