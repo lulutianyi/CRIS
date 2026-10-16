@@ -135,34 +135,40 @@ def predict_coco(
     if isinstance(model_names, list):
         model_names = dict(enumerate(model_names))
     predictions = []
-    results = detector.predict(
-        source=list(paths),
-        imgsz=640,
-        batch=batch_size,
-        conf=0.001,
-        iou=0.7,
-        verbose=False,
-        stream=True,
-    )
-    for image_id, result in zip(image_ids, results):
-        if result.boxes is None:
-            continue
-        xyxy = result.boxes.xyxy.detach().cpu()
-        confidence = result.boxes.conf.detach().cpu()
-        classes = result.boxes.cls.detach().cpu().long()
-        for box, score, class_index in zip(xyxy, confidence, classes):
-            category_id = category_by_name.get(model_names[int(class_index)])
-            if category_id is None:
+    for start in tqdm(
+        range(0, len(paths), batch_size), desc="COCO detector"
+    ):
+        stop = min(start + batch_size, len(paths))
+        batch_paths = list(paths[start:stop])
+        batch_ids = image_ids[start:stop]
+        results = detector.predict(
+            source=batch_paths,
+            imgsz=640,
+            batch=batch_size,
+            conf=0.001,
+            iou=0.7,
+            verbose=False,
+            stream=True,
+        )
+        for image_id, result in zip(batch_ids, results):
+            if result.boxes is None:
                 continue
-            x1, y1, x2, y2 = [float(value) for value in box]
-            predictions.append(
-                {
-                    "image_id": int(image_id),
-                    "category_id": int(category_id),
-                    "bbox": [x1, y1, x2 - x1, y2 - y1],
-                    "score": float(score),
-                }
-            )
+            xyxy = result.boxes.xyxy.detach().cpu()
+            confidence = result.boxes.conf.detach().cpu()
+            classes = result.boxes.cls.detach().cpu().long()
+            for box, score, class_index in zip(xyxy, confidence, classes):
+                category_id = category_by_name.get(model_names[int(class_index)])
+                if category_id is None:
+                    continue
+                x1, y1, x2, y2 = [float(value) for value in box]
+                predictions.append(
+                    {
+                        "image_id": int(image_id),
+                        "category_id": int(category_id),
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "score": float(score),
+                    }
+                )
     return predictions
 
 
