@@ -1,4 +1,4 @@
-"""Evaluate a stage-1 residual purifier with non-adaptive PGD on COCO."""
+"""Evaluate a COCO residual purifier with non-adaptive or adaptive PGD."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from pycocotools.coco import COCO
 from tqdm.auto import tqdm
 from torchvision.utils import save_image
@@ -45,11 +44,10 @@ def freeze_normalization(model):
 def detection_loss(model, image, target):
     model.train()
     freeze_normalization(model)
-    losses = model([image], [target])
-    return sum(losses.values())
+    return sum(model([image], [target]).values())
 
 
-def pgd_attack(model, clean, target, args, image_id):
+def nonadaptive_pgd(victim, _purifier, clean, target, args, image_id):
     torch.manual_seed(args.seed + int(image_id))
     adversarial = clean + torch.empty_like(clean).uniform_(
         -args.epsilon, args.epsilon
@@ -58,7 +56,7 @@ def pgd_attack(model, clean, target, args, image_id):
     initial_loss = None
     for _ in range(args.attack_steps):
         adversarial.requires_grad_(True)
-        loss = detection_loss(model, adversarial, target)
+        loss = detection_loss(victim, adversarial, target)
         if initial_loss is None:
             initial_loss = float(loss.detach())
         gradient = torch.autograd.grad(loss, adversarial, only_inputs=True)[0]
@@ -66,8 +64,36 @@ def pgd_attack(model, clean, target, args, image_id):
         delta = (adversarial - clean).clamp(-args.epsilon, args.epsilon)
         adversarial = (clean + delta).clamp(0, 1).detach()
     with torch.no_grad():
-        final_loss = detection_loss(model, adversarial, target)
-    model.eval()
+        final_loss = detection_loss(victim, adversarial, target)
+    victim.eval()
+    return adversarial, float(initial_loss), float(final_loss)
+
+
+def adaptive_pgd(victim, purifier, clean, target, args, image_id):
+    torch.manual_seed(args.seed + int(image_id))
+    adversarial = clean + torch.empty_like(clean).uniform_(
+        -args.epsilon, args.epsilon
+    )
+    adversarial = adversarial.clamp(0, 1).detach()
+    initial_loss = None
+    purifier.train()
+    purifier.gradient_checkpointing = True
+    for _ in range(args.attack_steps):
+        adversarial.requires_grad_(True)
+        purified, _ = purifier(adversarial.unsqueeze(0))
+        loss = detection_loss(victim, purified[0], target)
+        if initial_loss is None:
+            initial_loss = float(loss.detach())
+        gradient = torch.autograd.grad(loss, adversarial, only_inputs=True)[0]
+        adversarial = adversarial.detach() + args.attack_alpha * gradient.sign()
+        delta = (adversarial - clean).clamp(-args.epsilon, args.epsilon)
+        adversarial = (clean + delta).clamp(0, 1).detach()
+        del purified, loss, gradient
+    with torch.no_grad():
+        final_purified, _ = purifier(adversarial.unsqueeze(0))
+        final_loss = detection_loss(victim, final_purified[0], target)
+    purifier.eval()
+    victim.eval()
     return adversarial, float(initial_loss), float(final_loss)
 
 
@@ -82,6 +108,8 @@ def load_purifier(checkpoint_path, device):
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
     return model, checkpoint
 
 
@@ -108,13 +136,9 @@ def image_metrics(prediction, target):
     }
 
 
-def add_metric(totals, values):
+def add_metrics(totals, values):
     for name, value in values.items():
         totals[name] += float(value)
-
-
-def average_metrics(totals, count):
-    return {name: value / count for name, value in totals.items()}
 
 
 def safe_ratio(numerator, denominator):
@@ -126,8 +150,9 @@ def recovery(clean, adversarial, purified):
 
 
 def load_image_ids(args, coco):
-    if args.image_ids_json:
-        value = json.loads(args.image_ids_json.read_text(encoding="utf-8"))
+    source = args.image_ids_json or args.reference_summary
+    if source:
+        value = json.loads(source.read_text(encoding="utf-8"))
         image_ids = value["image_ids"] if isinstance(value, dict) else value
         return [int(image_id) for image_id in image_ids]
     return select_image_ids(coco, args.subset_size, args.seed)
@@ -138,7 +163,12 @@ def main():
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        raise RuntimeError("该评测包含PGD反向传播，请使用GPU运行时")
+        raise RuntimeError("PGD评测需要GPU运行时")
+
+    adaptive = args.attack_mode == "adaptive"
+    attack = adaptive_pgd if adaptive else nonadaptive_pgd
+    adversarial_key = "adaptive_adversarial" if adaptive else "adversarial"
+    purified_key = f"{adversarial_key}_purified"
 
     output_dir = Path(args.output_dir)
     preview_dir = output_dir / "previews_png"
@@ -147,23 +177,20 @@ def main():
 
     coco = COCO(str(args.annotations))
     image_ids = load_image_ids(args, coco)
-    dataset = CocoFixedSubset(
-        args.images, args.annotations, image_ids
-    )
+    dataset = CocoFixedSubset(args.images, args.annotations, image_ids)
     victim, weights = load_victim(device)
     purifier, checkpoint = load_purifier(args.checkpoint, device)
 
-    prediction_groups = {
+    groups = {
         "clean": [],
         "clean_purified": [],
-        "adversarial": [],
-        "adversarial_purified": [],
+        adversarial_key: [],
+        purified_key: [],
     }
     metric_names = ("mae", "psnr", "ssim", "highpass_psnr")
-    image_metric_totals = {
-        "adversarial": {name: 0.0 for name in metric_names},
-        "adversarial_purified": {name: 0.0 for name in metric_names},
-        "clean_purified": {name: 0.0 for name in metric_names},
+    metric_totals = {
+        name: {key: 0.0 for key in metric_names}
+        for name in (adversarial_key, purified_key, "clean_purified")
     }
     attack_totals = {
         "linf": 0.0,
@@ -173,35 +200,31 @@ def main():
         "loss_increased": 0,
     }
 
-    progress = tqdm(dataset, desc=f"COCO PGD-{args.attack_steps} purifier eval")
+    label = "adaptive" if adaptive else "nonadaptive"
+    progress = tqdm(dataset, desc=f"{label} PGD-{args.attack_steps}")
     for index, (image, target, _path, _name) in enumerate(progress):
         image_id = int(target["image_id"].item())
         clean = image.to(device)
         attack_target = target_to_device(target, device, attack_only=True)
 
-        prediction_groups["clean"].extend(
+        groups["clean"].extend(
             predict_one(victim, clean, image_id, args.score_threshold)
         )
         with torch.inference_mode():
             clean_purified, _ = purifier(clean.unsqueeze(0))
-        prediction_groups["clean_purified"].extend(
-            predict_one(
-                victim,
-                clean_purified[0],
-                image_id,
-                args.score_threshold,
-            )
+        groups["clean_purified"].extend(
+            predict_one(victim, clean_purified[0], image_id, args.score_threshold)
         )
 
-        adversarial, initial_loss, final_loss = pgd_attack(
-            victim, clean, attack_target, args, image_id
+        adversarial, initial_loss, final_loss = attack(
+            victim, purifier, clean, attack_target, args, image_id
         )
-        prediction_groups["adversarial"].extend(
+        groups[adversarial_key].extend(
             predict_one(victim, adversarial, image_id, args.score_threshold)
         )
         with torch.inference_mode():
             adversarial_purified, _ = purifier(adversarial.unsqueeze(0))
-        prediction_groups["adversarial_purified"].extend(
+        groups[purified_key].extend(
             predict_one(
                 victim,
                 adversarial_purified[0],
@@ -218,16 +241,16 @@ def main():
         attack_totals["loss_increased"] += int(final_loss > initial_loss)
 
         clean_batch = clean.unsqueeze(0)
-        add_metric(
-            image_metric_totals["adversarial"],
+        add_metrics(
+            metric_totals[adversarial_key],
             image_metrics(adversarial.unsqueeze(0), clean_batch),
         )
-        add_metric(
-            image_metric_totals["adversarial_purified"],
+        add_metrics(
+            metric_totals[purified_key],
             image_metrics(adversarial_purified, clean_batch),
         )
-        add_metric(
-            image_metric_totals["clean_purified"],
+        add_metrics(
+            metric_totals["clean_purified"],
             image_metrics(clean_purified, clean_batch),
         )
 
@@ -248,70 +271,96 @@ def main():
                 format="png",
             )
 
-        del clean, adversarial, clean_purified, adversarial_purified
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        del clean, clean_purified, adversarial, adversarial_purified
+        torch.cuda.empty_cache()
 
     detection = {}
-    for name, predictions in prediction_groups.items():
-        prediction_path = output_dir / f"{name}_predictions.json"
-        atomic_write_json(prediction_path, predictions)
-        detection[name] = evaluate_coco_predictions(
-            coco, image_ids, predictions
-        )
+    for name, predictions in groups.items():
+        atomic_write_json(output_dir / f"{name}_predictions.json", predictions)
+        detection[name] = evaluate_coco_predictions(coco, image_ids, predictions)
 
+    count = len(dataset)
     clean = detection["clean"]
     clean_purified = detection["clean_purified"]
-    adversarial = detection["adversarial"]
-    adversarial_purified = detection["adversarial_purified"]
-    summary = {
-        "dataset": "coco_val2017",
-        "subset_size": len(image_ids),
-        "seed": args.seed,
-        "image_ids": image_ids,
-        "victim": "fasterrcnn_resnet50_fpn_v2",
-        "victim_weights": str(weights),
-        "purifier_checkpoint": str(args.checkpoint),
-        "purifier_epoch": int(checkpoint.get("epoch", -1)),
-        "attack": {
-            "type": "non_adaptive_detection_loss_pgd",
-            "epsilon": args.epsilon,
-            "alpha": args.attack_alpha,
-            "steps": args.attack_steps,
-            "random_start": True,
-            "mean_linf": attack_totals["linf"] / len(dataset),
-            "mean_mae": attack_totals["mae"] / len(dataset),
-            "mean_initial_loss": attack_totals["initial_loss"] / len(dataset),
-            "mean_final_loss": attack_totals["final_loss"] / len(dataset),
-            "loss_increased_fraction": attack_totals["loss_increased"] / len(dataset),
-        },
-        "image_metrics": {
-            name: average_metrics(values, len(dataset))
-            for name, values in image_metric_totals.items()
-        },
-        "detection": detection,
-        "derived": {
+    adversarial = detection[adversarial_key]
+    purified = detection[purified_key]
+    attack_summary = {
+        "type": (
+            "end_to_end_adaptive_detection_loss_pgd"
+            if adaptive
+            else "non_adaptive_detection_loss_pgd"
+        ),
+        "epsilon": args.epsilon,
+        "alpha": args.attack_alpha,
+        "steps": args.attack_steps,
+        "random_start": True,
+        "mean_linf": attack_totals["linf"] / count,
+        "mean_mae": attack_totals["mae"] / count,
+        "loss_increased_fraction": attack_totals["loss_increased"] / count,
+    }
+    if adaptive:
+        attack_summary["mean_initial_defended_loss"] = (
+            attack_totals["initial_loss"] / count
+        )
+        attack_summary["mean_final_defended_loss"] = (
+            attack_totals["final_loss"] / count
+        )
+        derived = {
+            "adaptive_map50_95_recovery_vs_direct": recovery(
+                clean["map50_95"], adversarial["map50_95"], purified["map50_95"]
+            ),
+            "adaptive_map50_recovery_vs_direct": recovery(
+                clean["map50"], adversarial["map50"], purified["map50"]
+            ),
+            "defended_map50_95_retention": safe_ratio(
+                purified["map50_95"], clean_purified["map50_95"]
+            ),
+            "defended_map50_retention": safe_ratio(
+                purified["map50"], clean_purified["map50"]
+            ),
+        }
+    else:
+        attack_summary["mean_initial_loss"] = attack_totals["initial_loss"] / count
+        attack_summary["mean_final_loss"] = attack_totals["final_loss"] / count
+        derived = {
             "map50_95_recovery": recovery(
-                clean["map50_95"],
-                adversarial["map50_95"],
-                adversarial_purified["map50_95"],
+                clean["map50_95"], adversarial["map50_95"], purified["map50_95"]
             ),
             "map50_recovery": recovery(
-                clean["map50"],
-                adversarial["map50"],
-                adversarial_purified["map50"],
+                clean["map50"], adversarial["map50"], purified["map50"]
             ),
+        }
+    derived.update(
+        {
             "clean_map50_95_retention": safe_ratio(
                 clean_purified["map50_95"], clean["map50_95"]
             ),
             "clean_map50_retention": safe_ratio(
                 clean_purified["map50"], clean["map50"]
             ),
+        }
+    )
+
+    summary = {
+        "dataset": "coco_val2017",
+        "subset_size": count,
+        "seed": args.seed,
+        "image_ids": image_ids,
+        "victim": "fasterrcnn_resnet50_fpn_v2",
+        "victim_weights": str(weights),
+        "purifier_checkpoint": str(args.checkpoint),
+        "purifier_epoch": int(checkpoint.get("epoch", -1)),
+        "attack": attack_summary,
+        "image_metrics": {
+            name: {key: value / count for key, value in totals.items()}
+            for name, totals in metric_totals.items()
         },
+        "detection": detection,
+        "derived": derived,
     }
     summary_path = output_dir / "summary.json"
     atomic_write_json(summary_path, summary)
-    print("\n========== COCO Stage-1净化器检测评测 ==========")
+    print(f"\n========== COCO {label} PGD评测 ==========")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print("结果:", summary_path)
 
@@ -330,11 +379,17 @@ def seed_everything(seed):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--attack-mode",
+        choices=("nonadaptive", "adaptive"),
+        default="nonadaptive",
+    )
     parser.add_argument("--images", type=Path, required=True)
     parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--image-ids-json", type=Path)
+    parser.add_argument("--reference-summary", type=Path)
     parser.add_argument("--subset-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20261010)
     parser.add_argument("--epsilon", type=float, default=8 / 255)
