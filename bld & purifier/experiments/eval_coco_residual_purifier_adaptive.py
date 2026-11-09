@@ -132,6 +132,10 @@ def recovery(clean, adversarial, purified):
 
 
 def load_image_ids(args, coco):
+    if args.image_ids_json:
+        value = json.loads(args.image_ids_json.read_text(encoding="utf-8"))
+        image_ids = value["image_ids"] if isinstance(value, dict) else value
+        return [int(image_id) for image_id in image_ids]
     if args.reference_summary:
         summary = json.loads(args.reference_summary.read_text(encoding="utf-8"))
         return [int(value) for value in summary["image_ids"]]
@@ -330,6 +334,7 @@ def parse_args():
     parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--image-ids-json", type=Path)
     parser.add_argument("--reference-summary", type=Path)
     parser.add_argument("--subset-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20261010)

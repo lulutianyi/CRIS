@@ -125,6 +125,14 @@ def recovery(clean, adversarial, purified):
     return safe_ratio(purified - adversarial, clean - adversarial)
 
 
+def load_image_ids(args, coco):
+    if args.image_ids_json:
+        value = json.loads(args.image_ids_json.read_text(encoding="utf-8"))
+        image_ids = value["image_ids"] if isinstance(value, dict) else value
+        return [int(image_id) for image_id in image_ids]
+    return select_image_ids(coco, args.subset_size, args.seed)
+
+
 def main():
     args = parse_args()
     seed_everything(args.seed)
@@ -138,7 +146,7 @@ def main():
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     coco = COCO(str(args.annotations))
-    image_ids = select_image_ids(coco, args.subset_size, args.seed)
+    image_ids = load_image_ids(args, coco)
     dataset = CocoFixedSubset(
         args.images, args.annotations, image_ids
     )
@@ -326,6 +334,7 @@ def parse_args():
     parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--image-ids-json", type=Path)
     parser.add_argument("--subset-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20261010)
     parser.add_argument("--epsilon", type=float, default=8 / 255)
