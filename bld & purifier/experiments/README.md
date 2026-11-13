@@ -7,6 +7,7 @@
 
 - `coco_frcnn_common.py`：COCO、Faster R-CNN 和评测公共函数。
 - `prepare_coco_train_subset.py`：按固定 `split.json` 恢复训练图片。
+- `make_coco_train_split.py`：在旧训练集基础上生成无验证泄漏的扩展分割。
 - `make_coco_eval_ids.py`：生成固定且可排除旧样本的评测编号。
 - `train_coco_residual_purifier_stage1.py`：定义净化器并完成配对重建训练。
 - `train_coco_residual_purifier_stage2.py`：加入检测任务损失。

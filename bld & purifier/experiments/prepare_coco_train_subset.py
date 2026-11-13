@@ -120,7 +120,7 @@ def main():
         "dataset": "coco_train2017",
         "annotations": str(args.annotations),
         "output_dir": str(output_dir),
-        "requested_subset_size": args.subset_size,
+        "requested_subset_size": len(image_ids),
         "seed": args.seed,
         "selected_image_ids": image_ids,
         "completed": len(records),
