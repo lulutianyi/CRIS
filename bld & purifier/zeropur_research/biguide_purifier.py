@@ -78,6 +78,28 @@ class BiGuidePurifier(nn.Module):
             guides.append(global_blur * (1 - mask) + strong_blur * mask)
         return guides
 
+    def _local_guides_v2(
+        self,
+        x,
+        count,
+        grid,
+        ratio,
+        graph_steps,
+        generator,
+    ):
+        """One global guide plus detail-preserving locally blurred guides."""
+        blurred = _blur(x, 1.8)
+        guides = [blurred]
+        for _ in range(count):
+            mask = self._graph_mask(
+                len(x), grid, ratio, graph_steps, x.device, generator
+            )
+            mask = F.interpolate(
+                mask, size=x.shape[-2:], mode="bilinear", align_corners=False
+            )
+            guides.append(x * (1 - mask) + blurred * mask)
+        return guides
+
     @staticmethod
     def _noise_guides(x, scale, generator):
         gaussian = torch.randn(
@@ -139,6 +161,29 @@ class BiGuidePurifier(nn.Module):
         return self._optimize(
             inputs,
             lambda x: self._local_guides(
+                x, guides, grid, patch_ratio, graph_steps, generator
+            ),
+            self.deep_features,
+            eps,
+            steps,
+            step_size,
+        )
+
+    def local_graph_v2(
+        self,
+        inputs,
+        generator,
+        eps=10 / 255,
+        steps=10,
+        step_size=1 / 255,
+        guides=3,
+        grid=4,
+        patch_ratio=0.25,
+        graph_steps=2,
+    ):
+        return self._optimize(
+            inputs,
+            lambda x: self._local_guides_v2(
                 x, guides, grid, patch_ratio, graph_steps, generator
             ),
             self.deep_features,
